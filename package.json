@@ -1,0 +1,16 @@
+{
+  "name": "pi-zcode",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "ZCode browser-login Coding Plan providers with read-only diagnostics",
+  "repository": { "type": "git", "url": "https://github.com/0x1f/pi-zcode.git" },
+  "keywords": ["pi-package", "zcode"],
+  "engines": { "node": ">=22.19.0" },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "0.85.0",
+    "@earendil-works/pi-coding-agent": "0.85.0"
+  },
+  "pi": { "extensions": ["./index.ts"] },
+  "scripts": { "test": "node --test test.ts" }
+}
