@@ -43,6 +43,63 @@ function guardUrl(url: string, method: "GET" | "POST"): void {
   }
 }
 
+// Balance is verified against the live server (200 with these headers + app_version). Claiming is not: it is gated by
+// Aliyun captcha, and the response shape was never confirmed, so no request is built for it.
+const planOrigin = ZCODE_ORIGIN;
+const planBalancePath = "/api/v1/zcode-plan/billing/balance";
+const planClaimPath = "/api/v1/zcode-plan/billing/claim";
+const planVersion = "3.11.2";
+/** Credential field holding the session JWT the browser flow already returns; read-only balance use only. */
+export const ZCODE_JWT_FIELD = "zcodeJwt";
+const notVerified = (what: string): never => { throw new DiagnosticError(`${what} 尚未对真实服务端验证；请先提供一次真实响应样本，未猜测字段。`); };
+export const ZCODE_JWT_ENV = "ZCODE_JWT";
+
+/** Only a structurally complete JWT with a numeric user identifier and validity window; the signature is never checked locally. */
+export function verifiedZCodeJwt(raw: string): string {
+  if (!validSecret(raw)) throw new DiagnosticError("ZCode 登录令牌格式无效。");
+  const parts = raw.split(".");
+  if (parts.length !== 3 || !/^[A-Za-z0-9_-]+$/.test(parts[0]) || !/^[A-Za-z0-9_-]+$/.test(parts[1]) || !/^[A-Za-z0-9_-]+$/.test(parts[2])) {
+    throw new DiagnosticError("ZCode 登录令牌不是合法 JWT 结构；不猜测身份。");
+  }
+  let payload: Record<string, unknown>;
+  try { payload = object(JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"))); }
+  catch { throw new DiagnosticError("ZCode 登录令牌载荷无法解析；不猜测身份。"); }
+  const id = payload.user_id ?? payload.sub;
+  if (typeof id !== "string" || !/^[0-9]{1,32}$/.test(id.trim())) throw new DiagnosticError("ZCode 登录令牌缺少用户标识；不猜测身份。");
+  if (typeof payload.iat !== "number" || !Number.isFinite(payload.iat) || payload.iat <= 0) throw new DiagnosticError("ZCode 登录令牌缺少签发时间；无法判断是否过期。");
+  const ageDays = (Date.now() / 1000 - payload.iat) / 86400;
+  if (ageDays > 30) throw new DiagnosticError(`ZCode 登录令牌已签发 ${Math.floor(ageDays)} 天，可能已失效；请在官方客户端重新登录后更新 ${ZCODE_JWT_ENV}。`);
+  return raw;
+}
+
+function planHeaders(jwt: string): Record<string, string> {
+  // Verified request headers; the live server rejects the balance call with 400 when X-Device-Mid is absent.
+  // Sending them only to the guard-approved plan path below.
+  const device = process.env.ZCODE_DEVICE_MID;
+  if (device !== undefined && !/^[0-9a-f-]{1,128}$/i.test(device)) throw new DiagnosticError("ZCODE_DEVICE_MID 格式无效。");
+  return { Accept: "application/json", Authorization: `Bearer ${verifiedZCodeJwt(jwt)}`, "User-Agent": `ZCode/${planVersion}`, "X-ZCode-App-Version": planVersion, "X-Platform": "linux", "X-Title": "Z Code@electron", "HTTP-Referer": planOrigin, "X-Client-Language": "zh-CN", ...(device ? { "X-Device-Mid": device } : {}) };
+}
+
+async function planRequest(path: string, jwt: string, signal: AbortSignal | undefined, fetcher: typeof fetch): Promise<Record<string, unknown>> {
+  if (path !== planBalancePath) throw new DiagnosticError("拒绝非预期端点。");
+  const url = `${planOrigin}${path}?app_version=${planVersion}`;
+  const deadline = AbortSignal.timeout(DEADLINE_MS);
+  const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  try {
+    combined.throwIfAborted();
+    const response = await fetcher(url, { method: "GET", redirect: "error", credentials: "omit", signal: combined, headers: planHeaders(jwt) });
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new DiagnosticError(`HTTP ${response.status}；${response.status === 401 ? "登录令牌无效或已失效" : response.status === 400 ? "服务端拒绝参数（版本或头缺失）" : response.status === 405 || response.status === 429 ? "请求被风控拦截，请稍后在官方客户端操作" : "接口不可用"}；状态未知。`);
+    }
+    const body = await boundedBody(response, combined);
+    if (body.code !== 0) throw new DiagnosticError(`服务端返回业务失败（code=${label(body.code, "未知")}）；状态未知。`);
+    return body;
+  } catch (error) { throw new DiagnosticError(errorText(error)); }
+}
+
+const units = (value: unknown): number | undefined => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+
 const DEADLINE_MS = 15_000;
 async function boundedBody(response: Response, signal: AbortSignal): Promise<Record<string, unknown>> {
   const reader = response.body?.getReader();
@@ -144,7 +201,9 @@ async function loginBrowser(region: Region, interaction: ProviderAuthInteraction
     try { await sleep(interval, undefined, { signal: pollingSignal }); }
     catch (error) { throw new DiagnosticError(errorText(error)); }
   }
-  secret(session.token);
+  // The poll response carries both the business token and a session JWT; the JWT is the only credential the
+  // Start Plan endpoints accept, so keep it instead of discarding it after the non-empty check.
+  const sessionJwt = secret(session.token);
   secret(object(session.user).user_id);
   const account = object(session[config.account]);
   let businessToken = secret(account.access_token ?? (region === "cn" ? account.accessToken : undefined));
@@ -191,15 +250,23 @@ async function loginBrowser(region: Region, interaction: ProviderAuthInteraction
   const access = `${entry.apiKey}.${typeof copied.secretKey === "string" ? copied.secretKey : ""}`;
   if (!modelKey(access)) throw new DiagnosticError("未返回完整推理凭据；请到官方平台检查，不会把登录令牌当作 API key。");
   signal.throwIfAborted();
-  interaction.notify({ type: "info", message: "浏览器登录完成。Pi 保存后台取得的长期推理 key；/logout 仅删除本地凭据，停用时请到官方平台撤销 key。" });
+  interaction.notify({ type: "info", message: "浏览器登录完成。Pi 保存后台取得的长期推理 key 与会话 JWT（仅用于只读余额查询）；/logout 仅删除本地凭据，停用时请到官方平台撤销 key。" });
   // The stored access value is a long-lived model key, not an OAuth token with a fabricated refresh lifetime.
-  return { type: "oauth", access, refresh: "", expires: Number.MAX_SAFE_INTEGER, loginMethod: "zcode-browser", region, organizationId: target.organizationId, projectId: target.projectId };
+  return { type: "oauth", access, refresh: "", expires: Number.MAX_SAFE_INTEGER, loginMethod: "zcode-browser", region, organizationId: target.organizationId, projectId: target.projectId, env: { [ZCODE_JWT_FIELD]: sessionJwt } };
 }
 
 export function browserKey(region: Region, credential: Credential | undefined): string | undefined {
   if (!credential || credential.type !== "oauth") return undefined;
   if (credential.loginMethod !== "zcode-browser" || credential.region !== region || !modelKey(credential.access) || credential.refresh !== "" || credential.expires !== Number.MAX_SAFE_INTEGER || !pathId(credential.organizationId) || !pathId(credential.projectId)) throw new DiagnosticError(`浏览器凭据格式或区域不匹配，请重新 /login ${REGIONS[region].id}。`);
   return credential.access;
+}
+
+/** Session JWT saved from the browser login, else the ZCODE_JWT override. Only ever used for the read-only balance call. */
+export function planJwt(credential: Credential | undefined, override: string | undefined): string | undefined {
+  if (override !== undefined && override.trim() !== "") return override;
+  if (!credential || credential.type !== "oauth" || credential.loginMethod !== "zcode-browser") return undefined;
+  const stored = object(credential.env)[ZCODE_JWT_FIELD];
+  return typeof stored === "string" && stored.trim() ? stored : undefined;
 }
 
 export function makeProvider(region: Region, fetcher: typeof fetch = fetch) {
@@ -271,6 +338,35 @@ export function makeProvider(region: Region, fetcher: typeof fetch = fetch) {
     },
   };
   return { provider, status: () => ({ ...status, count: models.length }) };
+}
+
+/**
+ * Read-only Start Plan balances. Requires an explicit ZCode login token via ZCODE_JWT: the browser OAuth flow used here
+ * returns an inference API key, not the desktop session JWT, so there is nothing to read from stored credentials.
+ */
+export async function planReport(jwt: string | undefined, signal?: AbortSignal, fetcher: typeof fetch = fetch): Promise<string> {
+  if (!jwt) throw new DiagnosticError(`未找到 ZCode 登录令牌；请先 /login ${REGIONS.cn.id} 完成浏览器授权，或设置 ${ZCODE_JWT_ENV} 覆盖。`);
+  const body = await planRequest(planBalancePath, jwt, signal, fetcher);
+  const data = object(body.data);
+  const balances = Array.isArray(data.balances) ? data.balances.map(object) : [];
+  if (balances.length > 100) throw new DiagnosticError("Start Plan 余额条目过多；状态未知，不按零处理。");
+  const rows: string[] = [`ZCode Start Plan · 查询于 ${new Date().toISOString()}`];
+  for (const entry of balances) {
+    const total = units(entry.total_units), used = units(entry.used_units);
+    const models = Array.isArray(entry.capabilities) ? entry.capabilities.filter(c => typeof c === "string").map(c => c.replace(/^model:/, "")).join(",") : "";
+    if (total === undefined || used === undefined || used > total) throw new DiagnosticError("余额条目格式无效；状态未知。");
+    const remaining = Math.round((total - used) / total * 1000) / 10;
+    rows.push(`${label(entry.show_name, "未知额度")} · ${label(models, "未知模型")} · 已用 ${used}/${total}（剩余 ${remaining}%）· ${label(entry.period, "未知周期")} · ${label(entry.plan_id, "未知套餐")}`);
+  }
+  if (!balances.length) rows.push("服务端未返回余额；不代表没有套餐或额度为零。");
+  rows.push("额度只在官方 ZCode 网关结算；用 Coding key 直连模型不消耗 Start Plan 额度。",
+    "本命令只读，不领取、不调用模型、不提交或绕过验证码。");
+  return rows.join("\n");
+}
+
+/** Unimplemented by design: claiming is gated by Aliyun captcha, which this extension never solves or bypasses. */
+export function planClaimUnavailable(): never {
+  return notVerified(`POST ${planClaimPath}`);
 }
 
 export function timeText(value: unknown): string {

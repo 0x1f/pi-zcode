@@ -50,7 +50,7 @@ v0.3.0 移除了插件的手动 API key 登录和环境变量入口。旧 `api_k
 
 - 浏览器授权通过 ZCode CLI OAuth 服务完成；回调由官方服务器接收，不运行本地回调服务器、不读取浏览器 Cookie 或桌面凭据。
 - 浏览器登录后，在对应地区的账号业务接口取得推理 key。国内业务接口使用 BigModel 业务令牌，国际账号先进行 Z.ai 业务令牌交换；两区不混用令牌，也不把登录令牌直接当作模型 key。
-- Pi 按 `zcode-cn` / `zcode-intl` 保存原生 OAuth 类型记录，其中 `access` 是后台取得的长期模型 key。ZCode 会话令牌和临时业务令牌不持久化。
+- Pi 按 `zcode-cn` / `zcode-intl` 保存原生 OAuth 类型记录，其中 `access` 是后台取得的长期模型 key。poll 响应里的 ZCode 会话 JWT 保存在同一凭据的 `env.zcodeJwt`，只供 `plan status` 只读余额查询使用，永远不会被当作模型 key；临时业务令牌不持久化。
 - 本地长期 key 记录不安排 OAuth 刷新；没有编造刷新接口、刷新令牌或静默环境变量回退。失效后需要重新浏览器登录，服务器是否接受该 key 仍以实际请求为准。
 - **`/logout` 只删除本地记录，不撤销服务器上的 key。** 停用时请到相应官方平台撤销。Pi 凭据文件不是系统密钥链；有宿主权限的扩展仍能读取它。
 - 新建 key 只提交一次，不自动重试。即使网络中断或后续步骤失败，服务器也可能已经创建了 key，请到官方平台检查 `pi-zcode`。
@@ -69,7 +69,7 @@ intl: https://api.z.ai/api/coding/paas/v4
 
 不会自动切换到普通按量计费端点、另一个地区或免费计划。**Pi 显示零 token 成本不代表服务端免费**，请以订阅、官方控制台和账单为准。
 
-免费 Start Plan 的授权、权益和真实推理兼容性仍未验证，本版不接入。`/zcode-claim` 保持移除：领取请使用官方 ZCode 客户端 <https://zcode.z.ai/>，不自动签到、领取或处理 CAPTCHA。
+免费 Start Plan（体验套餐）的权益和领取只保留**只读查询**，自动领取和推理接入均不实现，详见下节。
 
 ## 诊断命令
 
@@ -80,6 +80,8 @@ intl: https://api.z.ai/api/coding/paas/v4
 /zcode-safe intl refresh
 /zcode-safe cn quota
 /zcode-safe intl quota
+/zcode-safe plan status
+/zcode-safe plan claim
 /zcode-safe cancel
 ```
 
@@ -87,7 +89,13 @@ intl: https://api.z.ai/api/coding/paas/v4
 - `refresh` 只读查询对应 Coding Plan 的 `/models`。404、权限拒绝或格式错误会保留最后成功目录并显示错误。Pi 自身允许联网的目录刷新也可能触发此请求。
 - 目录仅消费模型 ID；端点、头部、能力重新取 Pi 内置目录。未知模型不猜测参数，需更新 Pi。缓存按地区隔离，不是个人订阅授权证明；换账号后应主动刷新。
 - `quota` 只读查询 `/api/monitor/usage/quota/limit`；当前推理凭据可能无权访问。失败显示未知，不按零处理。服务端 `percentage` 原样展示，不推断剩余比例；可解析的时间转为 UTC。
+- `plan status` 只读查询 ZCode Start Plan 余额。JWT 优先从 `/login zcode-cn` 保存的浏览器凭据读取（服务端 poll 响应同时下发业务 token 与会话 JWT，扩展自 v0.3.1 起把 JWT 存在凭据 `env.zcodeJwt` 里，仅用于本只读查询）；也可用 `ZCODE_JWT` 覆盖。可选 `ZCODE_DEVICE_MID`（本机 UUID，缺失时服务端会返回 400）。JWT 只做结构与签发时间检查，不本地验签。输出带模型 ID、已用/总量和周期，空列表显示“不代表没有套餐”，不按零处理。
+- `plan claim` 明确不可用：领取接口未对真实服务端验证，且受阿里云验证码保护。请在官方客户端 <https://zcode.z.ai/> 领取，本扩展不自动签到、不处理验证码。
 - `cancel` 取消扩展的诊断或刷新；新诊断会取消旧诊断。登录和推理取消由 Pi 控制。
+
+### Start Plan 额度为什么不能在 Pi 里直接用
+
+实测结论（`zcode.z.ai` 真实响应）：Start Plan 额度**只在官方 ZCode 网关结算**——模型端点 `/api/v1/zcode-plan/anthropic/v1/messages` 要求阿里云验证码（无凭证返回 `3007 captcha verify failed`）并叠加客户端请求签名（`X-Client-Sig` 对 `apiKeyId ts clientVersion sessionId nonce` 签名 + `X-Client-Pow` 工作量证明，私钥由 `/api/paas/c1f3a7e2/v2/client` 下发）。用本扩展的 Coding API key 直连 `glm-5.3` 可正常推理，但**Start Plan 余额不变**（实测 81 tokens 消耗后三条余额均为 0）。这两层是官方的反滥用设计；绕过验证码或复刻客户端签名不在本扩展范围内。想在 Pi 里用 GLM-5.3，请走已授权的 Coding Plan key（按订阅计费）。
 
 自有认证、诊断请求限制 HTTPS 目标及方法/路径，拒绝重定向、使用 15 秒单次超时和 1 MiB 正文上限。登录期间按服务端间隔短暂轮询，最多等待五分钟；没有常驻轮询任务。遇到验证码挑战时仅提示官方处理，不下载脚本、不提交证明、不自动重放受保护请求。
 

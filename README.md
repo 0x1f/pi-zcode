@@ -45,16 +45,18 @@ Uses Pi's native OpenAI Completions transport, including system prompts, reasoni
 /zcode-safe intl refresh
 /zcode-safe cn quota
 /zcode-safe intl quota
+/zcode-safe plan status
+/zcode-safe plan claim
 /zcode-safe cancel
 ```
 
 Status is local; catalog and quota queries are read-only. Failed catalog refreshes retain the previous successful catalog. Unknown quota is not zero, and a displayed zero token cost does not mean the server is free. Model capabilities come only from Pi's known catalog.
 
-**Free Start Plan inference is not supported or verified.** Use the official ZCode client to claim benefits manually. `/zcode-claim` is not included.
+**Free Start Plan inference is not supported.** `/zcode-safe plan status` reads balances only, using the session JWT saved by the browser login (override with `ZCODE_JWT`); claiming and Start Plan inference are not implemented — the model gateway answers every request with a captcha error regardless of headers, and direct Coding-key calls do not draw from the plan. Use the official ZCode client to claim and consume benefits.
 
 ## Verification and limits
 
-Tested against Pi 0.85.0 and Node 26.8.1. The 14 offline checks cover browser flows, credential isolation, consent, cancellation, response validation, catalog races, quotas, and native streaming. Strict TypeScript checking passes with third-party declaration checking skipped.
+Tested against Pi 0.85.0 and Node 26.8.1. The 15 offline checks cover browser flows, credential isolation, consent, cancellation, response validation, catalog races, quotas, and native streaming. Strict TypeScript checking passes with third-party declaration checking skipped.
 
 ```sh
 node --test test.ts

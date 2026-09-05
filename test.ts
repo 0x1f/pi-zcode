@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createModels, InMemoryCredentialStore, InMemoryModelsStore, Type, type Context, type OAuthCredential, type ProviderAuthInteraction } from "@earendil-works/pi-ai";
 import extension from "./index.ts";
-import { BROWSER_KEY_NAME, REGIONS, ZCODE_ORIGIN, browserKey, codingUrl, errorText, makeProvider, quotaReport, readJson, timeText, type Region } from "./core.ts";
+import { BROWSER_KEY_NAME, REGIONS, ZCODE_JWT_FIELD, ZCODE_ORIGIN, browserKey, codingUrl, errorText, makeProvider, planJwt, quotaReport, readJson, timeText, type Region } from "./core.ts";
 
 // All requests must use explicit test fetch functions; never load real auth or Pi settings.
 globalThis.fetch = async () => { throw new Error("NETWORK DISABLED IN TESTS"); };
@@ -105,16 +105,19 @@ test("both browser flows reuse only the dedicated key; polling is bound to fresh
   for (const region of ["cn", "intl", "cn"] as const) {
     const f = browserFixture(region), credential = await f.login();
     authorizations.add(f.authorization());
-    assert.deepEqual(credential, oauthCredential(region));
+    // The poll response's session JWT is kept (read-only balance), never substituted for the model key.
+    assert.deepEqual(credential, { ...oauthCredential(region), env: { [ZCODE_JWT_FIELD]: "synthetic-zcode-session" } });
+    assert.equal(browserKey(region, credential), credential.access);
     assert.equal((await f.provider.auth.oauth!.toAuth(credential)).apiKey, credential.access);
     assert.equal(f.prompts.length, 0);
     assert.equal(f.calls.filter(c => c.slot === "create").length, 0);
     assert.equal(f.calls.filter(c => c.slot === "exchange").length, region === "intl" ? 1 : 0);
     assert(f.notices.some(n => n.type === "auth_url" && n.url.startsWith(REGIONS[region].authorizeUrl)));
     assert(f.notices.some(n => n.type === "info" && n.message.includes("/logout")));
+    // Secrets never reach notices; the session JWT is retained in the credential but must not be the model key.
     const output = JSON.stringify(f.notices);
     for (const value of [f.authorization(), "synthetic-zcode-session", "synthetic-business-token", `${region}-synthetic-account`, credential.access, `${region}-test-secret`]) assert(!output.includes(value));
-    assert(!JSON.stringify(credential).includes("synthetic-zcode-session"));
+    assert(!credential.access.includes("synthetic-zcode-session"));
   }
   assert.equal(authorizations.size, 3);
 });
@@ -391,4 +394,49 @@ test("extension registration/status require no network; command arguments cannot
   assert(!notices.at(-1)!.includes("DO-NOT-PRINT-SECRET"));
   await handlers.get("zcode-safe")("cn quota", ctx);
   assert.match(notices.at(-1)!, /未配置浏览器凭据/);
+});
+
+test("Start Plan reporting is read-only, requires a verifiable JWT and never claims blocked endpoints", async () => {
+  const { planReport, planClaimUnavailable, verifiedZCodeJwt, errorText } = await import("./core.ts");
+  const claim = "eyJhbGciOiJIUzI1NiJ9." + Buffer.from(JSON.stringify({ user_id: "72661775787316303", iat: Math.floor(Date.now() / 1000) }), "utf8").toString("base64url") + ".sig";
+  assert.equal(verifiedZCodeJwt(claim), claim);
+  for (const bad of ["short", "a.b", "a.b.c", "eyJhbGciOiJIUzI1NiJ9." + Buffer.from("{}").toString("base64url") + ".sig",
+    "eyJhbGciOiJIUzI1NiJ9." + Buffer.from(JSON.stringify({ user_id: "abc", iat: 1 }), "utf8").toString("base64url") + ".sig",
+    "eyJhbGciOiJIUzI1NiJ9." + Buffer.from(JSON.stringify({ user_id: "1", iat: Math.floor(Date.now() / 1000) - 40 * 86400 }), "utf8").toString("base64url") + ".sig"]) {
+    assert.throws(() => verifiedZCodeJwt(bad), /令牌|JWT/, `accepted ${bad}`);
+  }
+  await assert.rejects(planReport(undefined), /登录令牌|ZCODE_JWT/);
+  // The session JWT saved by browser login is used when no env override is set; anything else is ignored.
+  const stored = { type: "oauth", access: "id.secret", refresh: "", expires: Number.MAX_SAFE_INTEGER, loginMethod: "zcode-browser", region: "cn", organizationId: "org", projectId: "proj", env: { [ZCODE_JWT_FIELD]: claim } } as never;
+  assert.equal(planJwt(stored, undefined), claim);
+  assert.equal(planJwt(stored, "override.jwt.x"), "override.jwt.x", "env override wins");
+  assert.equal(planJwt(stored, "   "), claim, "blank override falls back to stored");
+  assert.equal(planJwt({ ...stored, env: {} } as never, undefined), undefined);
+  assert.equal(planJwt({ ...stored, env: { [ZCODE_JWT_FIELD]: 42 } } as never, undefined), undefined, "non-string ignored");
+  assert.equal(planJwt({ ...stored, loginMethod: "other" } as never, undefined), undefined, "only browser-login credentials");
+  assert.equal(planJwt({ type: "api_key", key: "k" } as never, undefined), undefined);
+  assert.equal(planJwt(undefined, undefined), undefined);
+  await assert.rejects(planReport(undefined, undefined, () => { throw new Error("must not fetch"); }), /登录令牌|ZCODE_JWT/);
+  const urls: string[] = [], methods: string[] = [], bodies: (string | undefined)[] = [];
+  const fetcher = fakeFetch((url, init) => {
+    urls.push(url); methods.push(init.method ?? "GET"); bodies.push(init.body as string | undefined);
+    return json({ code: 0, data: { balances: [{ show_name: "GLM-5.3", capabilities: ["model:glm-5.3"], total_units: 3_000_000, used_units: 750_000, period: "daily", plan_id: "zcode-v3-start-plan-0817" }] } });
+  });
+  const report = await planReport(claim, undefined, fetcher);
+  assert.match(report, /GLM-5\.3.*glm-5\.3.*750000\/3000000.*75%/);
+  assert.match(report, /只读/);
+  assert.deepEqual(methods, ["GET"], "no writes: " + methods.join(","));
+  assert.deepEqual(bodies, [undefined]);
+  assert(urls.every(u => u === `https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=3.11.2`), urls.join(" "));
+  for (const shape of [{ code: 0, data: { balances: [{ show_name: "x", total_units: 1, used_units: 5 }] } }, { code: 0, data: { balances: [{ total_units: "3", used_units: 1 }] } }, { code: 1 }, { code: 0, data: { balances: new Array(101).fill({ total_units: 1, used_units: 0 }) } }]) {
+    await assert.rejects(planReport(claim, undefined, fakeFetch(() => json(shape))), /格式|失败|过多/);
+  }
+  // An empty balance list is reported as unknown, never as zero or as "no plan".
+  assert.match(await planReport(claim, undefined, fakeFetch(() => json({ code: 0, data: {} }))), /不代表/);
+  await assert.rejects(planReport(claim, undefined, fakeFetch(() => new Response("{}", { status: 405 }))), /风控|状态未知/);
+  await assert.rejects(planReport(claim, undefined, fakeFetch(() => new Response("<html>", { status: 200 }))), /状态未知/);
+  assert.throws(() => planClaimUnavailable(), /尚未对真实服务端验证/);
+  // The saved JWT only ever reaches the read-only balance endpoint; it is never used as a model key.
+  assert.equal(browserKey("cn", stored), "id.secret");
+  assert.match(errorText(new Error("x")), /状态未知/);
 });
