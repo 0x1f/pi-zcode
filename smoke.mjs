@@ -5,19 +5,22 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
-if (!process.argv[2]) throw new Error("Usage: node smoke.mjs /absolute/path/to/pi/dist/bundle/cli.js [--ui]");
+if (!process.argv[2]) throw new Error("Usage: node smoke.mjs /absolute/path/to/pi/dist/bundle/cli.js [--ui] [--extension /path/to/package]");
 const sandbox = mkdtempSync(join(tmpdir(), "pi-zcode-smoke-"));
 const cli = resolve(process.argv[2]), source = dirname(fileURLToPath(import.meta.url));
-const extension = join(sandbox, "package", "index.ts");
+const override = process.argv.includes("--extension") ? resolve(process.argv[process.argv.indexOf("--extension") + 1]) : undefined;
+const extension = override ?? join(sandbox, "package", "index.ts");
 const agent = join(sandbox, "agent");
 const env = {
   HOME: sandbox, PATH: `${dirname(process.execPath)}:/usr/bin:/bin`,
   PI_CODING_AGENT_DIR: agent, PI_OFFLINE: "1", PI_TELEMETRY: "0",
 };
 try {
-  // No development node_modules or symlinks: exercise only the SDK modules Pi actually exposes.
-  mkdirSync(dirname(extension), { mode: 0o700 });
-  for (const file of ["index.ts", "core.ts", "package.json"]) copyFileSync(join(source, file), join(dirname(extension), file));
+  if (!override) {
+    // No development node_modules or symlinks: exercise only the SDK modules Pi actually exposes.
+    mkdirSync(dirname(extension), { mode: 0o700 });
+    for (const file of ["index.ts", "core.ts", "package.json"]) copyFileSync(join(source, file), join(dirname(extension), file));
+  }
   mkdirSync(agent, { mode: 0o700 });
   writeFileSync(join(agent, "auth.json"), JSON.stringify(Object.fromEntries(["cn", "intl"].map(region => [
     `zcode-${region}`, { type: "oauth", access: `${region}-synthetic-id.synthetic-secret`, refresh: "", expires: Number.MAX_SAFE_INTEGER, loginMethod: "zcode-browser", region, organizationId: "org", projectId: "project" },

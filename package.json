@@ -11,6 +11,10 @@
     "@earendil-works/pi-ai": "0.85.0",
     "@earendil-works/pi-coding-agent": "0.85.0"
   },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": { "optional": true },
+    "@earendil-works/pi-coding-agent": { "optional": true }
+  },
   "pi": { "extensions": ["./index.ts"] },
   "scripts": { "test": "node --test test.ts" }
 }
