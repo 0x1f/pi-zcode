@@ -19,7 +19,7 @@ try {
   if (!override) {
     // No development node_modules or symlinks: exercise only the SDK modules Pi actually exposes.
     mkdirSync(dirname(extension), { mode: 0o700 });
-    for (const file of ["index.ts", "core.ts", "package.json"]) copyFileSync(join(source, file), join(dirname(extension), file));
+    for (const file of ["index.ts", "core.ts", "plan.ts", "package.json"]) copyFileSync(join(source, file), join(dirname(extension), file));
   }
   mkdirSync(agent, { mode: 0o700 });
   writeFileSync(join(agent, "auth.json"), JSON.stringify(Object.fromEntries(["cn", "intl"].map(region => [

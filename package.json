@@ -1,9 +1,9 @@
 {
   "name": "pi-zcode",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
-  "description": "ZCode browser-login Coding Plan providers with read-only diagnostics",
+  "description": "ZCode browser-login Coding Plan providers with read-only diagnostics and browser-assisted Start Plan inference",
   "repository": { "type": "git", "url": "https://github.com/0x1f/pi-zcode.git" },
   "keywords": ["pi-package", "zcode"],
   "engines": { "node": ">=22.19.0" },

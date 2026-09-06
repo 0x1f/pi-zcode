@@ -5,6 +5,7 @@ import extension from "./index.ts";
 import { BROWSER_KEY_NAME, REGIONS, ZCODE_JWT_FIELD, ZCODE_ORIGIN, browserKey, codingUrl, errorText, makeProvider, planJwt, quotaReport, readJson, timeText, type Region } from "./core.ts";
 
 // All requests must use explicit test fetch functions; never load real auth or Pi settings.
+const loopbackFetch = globalThis.fetch; // recovered for 127.0.0.1 bridge tests only
 globalThis.fetch = async () => { throw new Error("NETWORK DISABLED IN TESTS"); };
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
 const fakeFetch = (fn: (url: string, init: RequestInit) => Response | Promise<Response>): typeof fetch =>
@@ -382,7 +383,7 @@ test("extension registration/status require no network; command arguments cannot
   extension({ registerProvider: (p: any) => providers.push(p.id), registerCommand: (n: string, c: any) => { commands.push(n); handlers.set(n, c.handler); }, on: (n: string) => events.push(n) } as any);
   assert.deepEqual(providers, [REGIONS.cn.id, REGIONS.intl.id]);
   assert.deepEqual(commands, ["zcode-safe"]);
-  assert.deepEqual(events, ["session_shutdown"]);
+  assert.deepEqual([...new Set(events)], ["session_shutdown", "before_provider_headers"]);
   const notices: string[] = [];
   const ctx = { ui: { notify: (text: string) => notices.push(text) }, modelRegistry: {
     getProviderAuthStatus: () => ({ configured: true, label: "DO-NOT-PRINT-SECRET" }),
@@ -439,4 +440,93 @@ test("Start Plan reporting is read-only, requires a verifiable JWT and never cla
   // The saved JWT only ever reaches the read-only balance endpoint; it is never used as a model key.
   assert.equal(browserKey("cn", stored), "id.secret");
   assert.match(errorText(new Error("x")), /状态未知/);
+});
+
+test("Start Plan bridge: parameter parsing, loopback round-trip, single-use header swap", async () => {
+  const { CaptchaBridge, PLAN_KEY_MARKER, applyPlanHeaders, fetchCaptchaConfig, parseCaptchaParam, planBaseUrl, planKeyJwt, planModels } = await import("./plan.ts");
+  const config = { region: "cn", prefix: "pfx", sceneId: "scene" };
+  // Config parsing fails closed on anything but an enabled, well-shaped captcha config.
+  for (const body of [{}, { data: { configs: { captcha: { enabled: false, region: "cn", prefix: "p", sceneId: "s" } } } }, { data: { configs: { captcha: { enabled: true } } } }, { data: { configs: { captcha: { enabled: true, region: 1, prefix: "p", sceneId: "s" } } } }]) {
+    await assert.rejects(fetchCaptchaConfig("jwt", fakeFetch(() => json(body))), /配置/);
+  }
+  await assert.rejects(fetchCaptchaConfig("jwt", fakeFetch(() => new Response("{}", { status: 403 }))), /403/);
+  const goodConfig = await fetchCaptchaConfig("jwt", fakeFetch((url, init) => {
+    assert.equal(url, "https://zcode.z.ai/api/v1/client/configs?app_version=3.11.2&platform=linux-x64");
+    assert.equal(new Headers(init.headers).get("authorization"), "Bearer jwt");
+    return json({ data: { configs: { captcha: { enabled: true, region: "cn", prefix: "pfx", sceneId: "scene" } } } });
+  }));
+  assert.deepEqual(goodConfig, config);
+  // Parameter structural validation: base64 JSON with certifyId, isSign, securityToken.
+  const raw = (body: unknown) => Buffer.from(JSON.stringify(body), "utf8").toString("base64");
+  const validParam = { certifyId: "abc12", sceneId: "scene", isSign: true, securityToken: "s".repeat(40) };
+  const valid = parseCaptchaParam(raw(validParam));
+  assert.equal(valid.certifyId, "abc12");
+  for (const bad of ["", "not base64!", raw({ ...validParam, isSign: false }),
+    raw({ ...validParam, certifyId: "no" }),
+    raw({ certifyId: "abc12", isSign: true, securityToken: "s".repeat(40) }), raw({ ...validParam, sceneId: "" }),
+    raw([{ certifyId: "abc12" }]), Buffer.from("plain text body", "utf8").toString("base64")]) {
+    assert.throws(() => parseCaptchaParam(bad), /参数|certifyId|签名|sceneId|securityToken/, `accepted ${String(bad).slice(0, 30)}`);
+  }
+  // Models: anthropic API against the fixed plan gateway, zero cost, image+reasoning.
+  const models = planModels();
+  assert.equal(models.length, 1);
+  assert.equal(models[0].api, "anthropic-messages");
+  assert.equal(models[0].baseUrl, planBaseUrl);
+  assert.equal(models[0].provider, "zcode-plan");
+  assert.deepEqual(models[0].cost, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+  assert(models[0].input.includes("image") && models[0].reasoning);
+  // Loopback bridge round-trip: page served, params queued once per certifyId, health reported.
+  const bridge = new CaptchaBridge();
+  const url = await bridge.start(config);
+  const origin = new URL(url).origin;
+  assert.match(url, /^http:\/\/127\.0\.0\.1:\d+\/$/);
+  const pageResponse = await loopbackFetch(url, { headers: { Connection: "close" } });
+  assert.match(await pageResponse.text(), /initAliyunCaptcha/);
+  assert.equal((await (await loopbackFetch(`${origin}/health`, { headers: { Connection: "close" } })).json()).queue, 0);
+  await loopbackFetch(`${origin}/param`, { method: "POST", body: raw(validParam), headers: { Connection: "close" } });
+  await loopbackFetch(`${origin}/param`, { method: "POST", body: raw(validParam), headers: { Connection: "close" } });
+  assert.equal((await (await loopbackFetch(`${origin}/health`, { headers: { Connection: "close" } })).json()).queue, 1, "duplicate certifyId ignored");
+  assert.equal(planKeyJwt(PLAN_KEY_MARKER + "session.jwt"), "session.jwt");
+  assert.equal(planKeyJwt("sk-ant-oat-xyz"), undefined);
+  assert.equal(planKeyJwt(PLAN_KEY_MARKER + ""), undefined);
+  // Header swap consumes exactly one queued parameter and never leaves the marker behind.
+  const headers: Record<string, string | null> = { "x-api-key": PLAN_KEY_MARKER + "session.jwt", accept: "application/json" };
+  await applyPlanHeaders(headers, bridge);
+  assert.equal(headers["x-api-key"], null);
+  assert.equal(headers["authorization"], "Bearer session.jwt");
+  assert.match(String(headers["X-Aliyun-Captcha-Verify-Param"]), /^eyJ/);
+  assert.equal(headers["X-Aliyun-Captcha-Verify-Region"], "cn");
+  assert.equal((await (await loopbackFetch(`${origin}/health`, { headers: { Connection: "close" } })).json()).served, 1);
+  // Non-plan requests are untouched, and an empty queue times out instead of blocking forever.
+  const untouched: Record<string, string | null> = { "x-api-key": "other-key" };
+  await applyPlanHeaders(untouched, bridge);
+  assert.equal(untouched["x-api-key"], "other-key");
+  await assert.rejects(applyPlanHeaders({ "x-api-key": PLAN_KEY_MARKER + "session.jwt" }, bridge, 100), /超时/);
+  // A JWT is required before anything starts.
+  bridge.stop();
+  const blocked = new CaptchaBridge();
+  await blocked.take(50).catch(error => assert.match(String(error), /超时/));
+});
+
+test("Start Plan extension surface: opt-in commands register no model provider until enabled", async () => {
+  const extension = (await import("./index.ts")).default;
+  const providers: string[] = [], commands: string[] = [], events: string[] = [];
+  const handlers = new Map<string, any>();
+  extension({ registerProvider: (p: any) => providers.push(p.id), registerCommand: (n: string, c: any) => { commands.push(n); handlers.set(n, c.handler); }, on: (n: string, h: any) => { events.push(n); if (!handlers.has(`on:${n}`)) handlers.set(`on:${n}`, h); } } as any);
+  assert.deepEqual(providers, [REGIONS.cn.id, REGIONS.intl.id], "the plan provider must not exist before /zcode-safe plan on");
+  assert(events.includes("before_provider_headers"));
+  const notices: string[] = [];
+  const ctx = { ui: { notify: (text: string, level?: string) => notices.push(`${level ?? "info"}:${text}`) } };
+  await handlers.get("zcode-safe")("plan status", ctx);
+  assert.match(notices.at(-1)!, /未启用/);
+  await handlers.get("zcode-safe")("plan on", ctx);
+  assert.match(notices.at(-1)!, /登录令牌|ZCODE_JWT/);
+  await handlers.get("zcode-safe")("plan off", ctx);
+  assert.match(notices.at(-1)!, /停用/);
+  await handlers.get("zcode-safe")("plan bogus", ctx);
+  assert.match(notices.at(-1)!, /用法/);
+  // The registered header hook must leave non-plan requests untouched while the plan is off.
+  const headers = { "x-api-key": "other-provider-key" };
+  await handlers.get("on:before_provider_headers")({ type: "before_provider_headers", headers });
+  assert.equal(headers["x-api-key"], "other-provider-key");
 });

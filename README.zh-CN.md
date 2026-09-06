@@ -89,13 +89,21 @@ intl: https://api.z.ai/api/coding/paas/v4
 - `refresh` 只读查询对应 Coding Plan 的 `/models`。404、权限拒绝或格式错误会保留最后成功目录并显示错误。Pi 自身允许联网的目录刷新也可能触发此请求。
 - 目录仅消费模型 ID；端点、头部、能力重新取 Pi 内置目录。未知模型不猜测参数，需更新 Pi。缓存按地区隔离，不是个人订阅授权证明；换账号后应主动刷新。
 - `quota` 只读查询 `/api/monitor/usage/quota/limit`；当前推理凭据可能无权访问。失败显示未知，不按零处理。服务端 `percentage` 原样展示，不推断剩余比例；可解析的时间转为 UTC。
-- `plan status` 只读查询 ZCode Start Plan 余额。JWT 优先从 `/login zcode-cn` 保存的浏览器凭据读取（服务端 poll 响应同时下发业务 token 与会话 JWT，扩展自 v0.3.1 起把 JWT 存在凭据 `env.zcodeJwt` 里，仅用于本只读查询）；也可用 `ZCODE_JWT` 覆盖。可选 `ZCODE_DEVICE_MID`（本机 UUID，缺失时服务端会返回 400）。JWT 只做结构与签发时间检查，不本地验签。输出带模型 ID、已用/总量和周期，空列表显示“不代表没有套餐”，不按零处理。
-- `plan claim` 明确不可用：领取接口未对真实服务端验证，且受阿里云验证码保护。请在官方客户端 <https://zcode.z.ai/> 领取，本扩展不自动签到、不处理验证码。
+- `plan status` 显示 Start Plan 与桥接状态；`/zcode-safe plan status` 的余额查询只读。JWT 优先从 `/login zcode-cn` 保存的浏览器凭据读取（`env.zcodeJwt`），也可用 `ZCODE_JWT` 覆盖。可选 `ZCODE_DEVICE_MID`（本机 UUID，缺失时服务端会返回 400）。JWT 只做结构与签发时间检查，不本地验签。输出带模型 ID、已用/总量和周期，空列表显示“不代表没有套餐”，不按零处理。
+- `plan on` 启用免费 Start Plan 推理（见下节）。`plan off` 停用并关闭桥接。`plan claim` 明确不可用：领取接口未对真实服务端验证，且受阿里云验证码保护。请在官方客户端 <https://zcode.z.ai/> 领取，本扩展不自动签到。
 - `cancel` 取消扩展的诊断或刷新；新诊断会取消旧诊断。登录和推理取消由 Pi 控制。
 
-### Start Plan 额度为什么不能在 Pi 里直接用
+### Start Plan 免费额度在 Pi 中的使用（v0.4.0 起）
 
-实测结论（`zcode.z.ai` 真实响应）：Start Plan 额度**只在官方 ZCode 网关结算**——模型端点 `/api/v1/zcode-plan/anthropic/v1/messages` 要求阿里云验证码（无凭证返回 `3007 captcha verify failed`）并叠加客户端请求签名（`X-Client-Sig` 对 `apiKeyId ts clientVersion sessionId nonce` 签名 + `X-Client-Pow` 工作量证明，私钥由 `/api/paas/c1f3a7e2/v2/client` 下发）。用本扩展的 Coding API key 直连 `glm-5.3` 可正常推理，但**Start Plan 余额不变**（实测 81 tokens 消耗后三条余额均为 0）。这两层是官方的反滥用设计；绕过验证码或复刻客户端签名不在本扩展范围内。想在 Pi 里用 GLM-5.3，请走已授权的 Coding Plan key（按订阅计费）。
+**协议事实**（2026-09-05/06 对真实服务端逐条验证）：
+1. Start Plan 模型端点 = `https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`（Anthropic 协议），身份为桌面会话 JWT（`env.zcodeJwt`）`Authorization: Bearer`。
+2. 每个请求都必须携带**新鲜的**阿里云验证码参数（`X-Aliyun-Captcha-Verify-Param` + `X-Aliyun-Captcha-Verify-Region: cn`），否则 `3007`。参数为 base64 JSON `{certifyId, sceneId, isSign, securityToken}`（约 280 字节），**一次性**（同一参数第二次请求即 `3007`），绑定 `certifyId`（重复提交触发 `F008`）。
+3. 参数由官方 AliyunCaptcha SDK（`SceneId`/`prefix` 取自 `/api/v1/client/configs`）在真实浏览器里产生：无感通过（`traceless`）或弹窗人工完成。请求签名不是门禁——官方客户端白名单明确跳过模型路径。
+4. 参数有效但行为被风控判定异常时，网关返回 `3012/405 "unusual activity"`；此时官方客户端同样被拦，等待即可恢复。
+
+**使用方式**：`/zcode-safe plan on` 后，扩展在本机 `127.0.0.1` 起一个桥接页，用你自己的浏览器打开一次即可。官方 SDK 在你的浏览器里验证（与官方桌面客户端同一组件）——风控信任时无感通过，弹出挑战时需你手动完成一次。产生的参数只发往本机；pi 对每个推理请求注入一个新参数并替换网关请求头。模型：`/model zcode-plan/glm-5.3-flash`（🆓 限免）。
+
+**边界（明确不做）**：本扩展不用算法/轨迹模拟/打码服务自动过滑块，不重放或批量预生成参数——验证始终由真人浏览器中的官方 SDK 完成。风控拦截不自动重试；额度以官方网关结算，Pi 显示零成本不代表免费。
 
 自有认证、诊断请求限制 HTTPS 目标及方法/路径，拒绝重定向、使用 15 秒单次超时和 1 MiB 正文上限。登录期间按服务端间隔短暂轮询，最多等待五分钟；没有常驻轮询任务。遇到验证码挑战时仅提示官方处理，不下载脚本、不提交证明、不自动重放受保护请求。
 

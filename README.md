@@ -45,6 +45,8 @@ Uses Pi's native OpenAI Completions transport, including system prompts, reasoni
 /zcode-safe intl refresh
 /zcode-safe cn quota
 /zcode-safe intl quota
+/zcode-safe plan on
+/zcode-safe plan off
 /zcode-safe plan status
 /zcode-safe plan claim
 /zcode-safe cancel
@@ -52,11 +54,13 @@ Uses Pi's native OpenAI Completions transport, including system prompts, reasoni
 
 Status is local; catalog and quota queries are read-only. Failed catalog refreshes retain the previous successful catalog. Unknown quota is not zero, and a displayed zero token cost does not mean the server is free. Model capabilities come only from Pi's known catalog.
 
-**Free Start Plan inference is not supported.** `/zcode-safe plan status` reads balances only, using the session JWT saved by the browser login (override with `ZCODE_JWT`); claiming and Start Plan inference are not implemented — the model gateway answers every request with a captcha error regardless of headers, and direct Coding-key calls do not draw from the plan. Use the official ZCode client to claim and consume benefits.
+**Free Start Plan inference is opt-in and browser-assisted.** The Start Plan gateway (`/api/v1/zcode-plan/anthropic/v1/messages`, Anthropic protocol, authenticated by the session JWT from browser login) rejects every request that lacks a fresh Aliyun captcha parameter with `3007`. The parameter is single-use and bound to a `certifyId`; it is produced by the official AliyunCaptcha SDK running in a real browser.
+
+`/zcode-safe plan on` therefore starts a loopback-only local page: open it once in your own browser, and the official SDK verifies there — tracelessly whenever the risk engine is satisfied, with you completing any interactive challenge by hand. The page POSTs produced parameters to `127.0.0.1` only; pi injects one fresh parameter per request and swaps in the gateway headers. Model: `zcode-plan/glm-5.3-flash` (🆓). `/logout` and `plan off` tear the bridge down; nothing is solved programmatically, no slider algorithm or solver service is used, and requests the gateway blocks as unusual activity (`3012`/`405`) are surfaced and never retried automatically. Plan claiming stays unimplemented (the same captcha gate, and still unverified server-side). Direct Coding-key calls draw from the subscription, not the plan.
 
 ## Verification and limits
 
-Tested against Pi 0.85.0 and Node 26.8.1. The 15 offline checks cover browser flows, credential isolation, consent, cancellation, response validation, catalog races, quotas, and native streaming. Strict TypeScript checking passes with third-party declaration checking skipped.
+Tested against Pi 0.85.0 and Node 26.8.1. The 17 offline checks cover browser flows, credential isolation, consent, cancellation, response validation, catalog races, quotas, native streaming, and the Start Plan bridge (parameter parsing, loopback round-trip, single-use header swap). Strict TypeScript checking passes with third-party declaration checking skipped.
 
 ```sh
 node --test test.ts
