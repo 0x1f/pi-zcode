@@ -1,0 +1,9 @@
+{
+  "name": "ali-slider",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Vendor-neutral slider-captcha toolkit: gap detection, human-like drag tracks, and an official-SDK result reader. Decoupled from pi-zcode; does not forge or bypass captcha solves.",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": { "test": "node --test test/*.ts" }
+}
